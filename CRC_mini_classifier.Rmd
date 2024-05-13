@@ -1,0 +1,781 @@
+---
+title: "CRC case study"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: yes
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F, cache= F)
+# library(mxnet)
+library(DeepCC)
+library(reshape2)
+library(dplyr)
+library(data.table)
+library(DT)
+library(gaofenglib)
+library(caret)
+library(parallel)
+library(survival)
+library(gfplot)
+```
+
+# Infomation
+
+- Analysis: **Feng, GAO ([Dr. Xin WANG's Lab @ CityU HK](http://cityu-hk-compbio.com/))**  
+- Update date: `r Sys.Date()`  
+
+# CRC
+
+## Identify signature genes for deep features
+```{r eval=F}
+load("../data/crc.RData")
+# load("~/workspace/coad2015/figures/DeepFeaturesCRC_TCGA.RData")
+
+eps <- crc$tcga$eps
+df <- crc$tcga$df
+# df <- DF_COAD_TCGA
+
+calcEPCor <- function(ep, f){
+  n <- ncol(ep)
+  sapply(1:10, function(idx.feature){
+    tmp <- unlist(mclapply(1:n, function(idx) cor(ep[,idx], f[, idx.feature]), mc.cores = 60))
+    tmp[is.na(tmp)] <- 0
+    names(tmp) <- colnames(ep)[1:n]
+    tmp
+  })
+}
+
+findBioMarker <- function(correlation, eps, cutoff, access, groups=NULL, n=10){
+  library(org.Hs.eg.db)
+  ep.average <- colMeans(eps)
+  ep.genenames <- colnames(eps)
+  ep.mad <- apply(eps, 2, mad)
+  
+  res <- do.call(rbind, lapply(1:10, function(idx){
+    genes <- head(order(abs(correlation[,idx]), decreasing = T), n)
+    df <- data.frame(Feature=idx,
+                     Gene=select(org.Hs.eg.db, keytype = "ENTREZID", key=ep.genenames[genes], columns = "SYMBOL"),
+                     AverageExperssion=ep.average[genes],
+                     MAD=ep.mad[genes])
+    
+    df <- df[df$Gene.ENTREZID %in% access, ]
+    df <- df[df$AverageExperssion > cutoff, ]
+    df <- df[order(df$MAD, decreasing = T), ]
+    head(df, 3)
+  }))
+  if(!is.null(groups)) {
+    res <- do.call(rbind, lapply(1:length(groups), function(i) {
+      idx <- groups[[i]]
+      tmp <- res[res$Feature %in% idx, ]
+      tmp$Feature <- paste("FeatureGroup", i)
+      tmp[match(unique(tmp$Gene.ENTREZID), tmp$Gene.ENTREZID), ]
+    }))
+  } 
+  res
+}
+
+ep.cor <- calcEPCor(eps, df)
+
+access <- Reduce(intersect, lapply(crc[c(1, 10, 13,14)], function(x) colnames(x$eps)))
+#access <- colnames(crc$tcga$eps)
+
+groups <- list(c(3,4,1,10), c(5,8),c(7,9,2,6))
+res <- findBioMarker(ep.cor, eps, 3, access, groups)
+sig.genes <- unique(res$Gene.ENTREZID)
+
+write.csv(res, file = "21genes.csv", row.names = F, quote = F)
+```
+
+## Evaluation of the performance
+```{r eval=F}
+library(CMSclassifier)
+curateExpressionProfile <- function(gex, siggenes=mgenes){
+  newdat <- as.matrix(gex)[,match(siggenes, colnames(gex))]
+  colnames(newdat) <- siggenes
+  newdat[is.na(newdat)] <- 0
+  scale(newdat, scale = F)
+}
+
+#sig.genes <- mgenes
+
+train_lab <- as.factor(crc$tcga$labels)
+train_df <- curateExpressionProfile(crc$tcga$eps, sig.genes)
+ind <- !is.na(train_lab)
+
+df <- data.frame(labs=train_lab[ind], train_df[ind, ], check.names = F)
+
+tc <- trainControl(method="cv", number=5)
+fit <- train(labs ~ ., df, method="svmRadial", trControl = tc, metric = "Accuracy", prob.model=TRUE)
+print(fit)
+
+
+
+train_lab <- as.factor(crc$gse39582$labels)
+train_df <- curateExpressionProfile(crc$gse39582$eps, sig.genes)
+ind <- !is.na(train_lab)
+
+df <- data.frame(labs=train_lab[ind], train_df[ind, ], check.names = F)
+
+tc <- trainControl(method="cv", number=5)
+fit <- train(labs ~ ., df, method="svmRadial", trControl = tc, metric = "Accuracy", prob.model=TRUE)
+print(fit)
+```
+
+```{r}
+train_lab <- as.factor(crc$tcga$labels)
+train_df <- curateExpressionProfile(crc$tcga$eps, sig.genes)
+ind <- !is.na(train_lab)
+
+df <- data.frame(labs=train_lab[ind], train_df[ind, ], check.names = F)
+
+tc <- trainControl(method="cv", number=5)
+fit <- train(labs ~ ., df, method="svmRadial", trControl = tc, metric = "Accuracy", prob.model=TRUE)
+print(fit)
+
+```
+
+
+## Deep Features for prognosis
+
+```{r}
+extract_tcga_clinical <- function (clin) 
+{
+    stage <- clin[, "patient.stage_event.pathologic_stage"]
+    names(stage) <- toupper(clin[, "patient.bcr_patient_barcode"])
+    pt_stage23 <- names(stage)[grep("ii", stage)]
+    stage[grep("iv", stage)] <- 4
+    stage[grep("iii", stage)] <- 3
+    stage[grep("ii", stage)] <- 2
+    stage[grep("i", stage)] <- 1
+    s <- as.numeric(stage)
+    names(s) <- names(stage)
+    stage <- s
+    labels <- clin[, "patient.follow_ups.follow_up.new_tumor_events.new_tumor_event_after_initial_treatment"]
+    names(labels) <- toupper(clin[, "patient.bcr_patient_barcode"])
+    relapse <- (labels == "yes")
+    names(relapse) <- names(labels)
+    t <- c("patient.follow_ups.follow_up.new_tumor_events.new_tumor_event.days_to_new_tumor_event_after_initial_treatment", 
+        "patient.follow_ups.follow_up.days_to_death", "patient.follow_ups.follow_up.days_to_last_followup")
+    tmp <- clin[, t]
+    colnames(tmp) <- NULL
+    time <- tmp[, 1]
+    time[is.na(time)] <- as.vector(t(tmp[is.na(time), 2]))
+    time[is.na(time)] <- as.vector(t(tmp[is.na(time), 3]))
+    relapse.time <- as.numeric(time)
+    names(relapse.time) <- toupper(clin[, "patient.bcr_patient_barcode"])
+    labels <- clin[, "patient.vital_status"]
+    names(labels) <- toupper(clin[, "patient.bcr_patient_barcode"])
+    death <- (labels == "dead")
+    names(death) <- names(labels)
+    t <- c("patient.follow_ups.follow_up.days_to_death", "patient.follow_ups.follow_up.days_to_last_followup")
+    tmp <- clin[, t]
+    colnames(tmp) <- NULL
+    time <- tmp[, 1]
+    time[is.na(time)] <- as.vector(t(tmp[is.na(time), 2]))
+    death.time <- as.numeric(time)
+    names(death.time) <- toupper(clin[, "patient.bcr_patient_barcode"])
+    data.frame(stage, relapse, relapse.time, death, death.time)
+}
+
+# grep("chemo", rownames(clin), value = T)
+# 
+# clin["patient.history_of_neoadjuvant_treatment", ]
+
+```
+
+### All stage
+
+```{r}
+# TCGA clinical information
+# clin <- data.table::fread("~/workspace/CRC/prescreen/data-raw/gdac.broadinstitute.org_COADREAD.Merge_Clinical.Level_1.2016012800.0.0/COADREAD.clin.merged.txt", stringsAsFactors = F, data.table = F)
+clin_all <- data.table::fread("../data/gdac.broadinstitute.org_COADREAD.Merge_Clinical.Level_1.2016012800.0.0/COADREAD.clin.merged.txt", stringsAsFactors = F, data.table = F)
+rownames(clin_all) <- clin_all[, 1]
+clin_all <- clin_all[, -1]
+
+clin <- gaofenglib::extract_tcga_clinical(t(clin_all))
+clin[clin < 0] <- NA
+rownames(clin) <- toupper(clin_all["patient.bcr_patient_barcode",])
+
+clin.tcga <- clin[substr(rownames(crc$tcga$eps), 1, 12), ]
+
+clin.tcga$relapse.time <- clin.tcga$relapse.time/30
+clin.tcga$death.time <- clin.tcga$death.time/30
+
+
+
+library(survival)
+library(survivalROC)
+
+rfs <- Surv(clin.tcga$relapse.time, clin.tcga$relapse)
+newdata <- data.frame(scale(crc$tcga$eps[, sig.genes]))
+model <- coxph(rfs ~ .,data=newdata)
+
+rs <- predict(model, newdata)
+p <- survivalROC(Stime = rfs[, 1], status = rfs[, 2], marker = rs, predict.time = 12*5, method="KM")
+idx <- with(p, which.min(1-TP+ FP))
+rs_cut <- p$cut.values[idx]
+
+save(model, rs_cut, sig.genes, file = "21genes.RData")
+```
+
+```{r}
+group <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+clin.tcga$risk <- group
+
+load(file="../data/crc.cit.clin.RData")
+
+newdata <- (data.frame(scale(crc$gse39582$eps[, sig.genes])))
+sur <- Surv(as.numeric(as.character(clin$rfs_delay)), factor(clin$rfs_event, levels = 0:1))
+rs <-predict(model, newdata)
+group <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+
+clin.cit <- clin
+clin.cit$risk <- group
+
+clin.cit$chemotherapy_adjuvant[clin.cit$chemotherapy_adjuvant == "na"] <- NA
+clin.cit$chemotherapy_adjuvant <- clin.cit$chemotherapy_adjuvant == "y"
+
+save(clin.tcga, clin.cit, file = "clin.risk.group.RData")
+```
+
+
+```{r}
+info <- clin.tcga
+rfs <- Surv(info$relapse.time, info$relapse)
+
+p1 <- plot_KMCurve(rfs, info$risk, annot = "",
+                         palette = "jama", xlab = "Follow up (months)", title = "TCGA CRC (training)", risk.table = T, limit = 60)
+
+info <- clin.cit
+rfs <- Surv(as.numeric(as.character(info$rfs_delay)), factor(info$rfs_event, levels = 0:1))
+
+p2 <- plot_KMCurve(rfs, info$risk, annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "CIT (validation)", risk.table = T, limit = 60) 
+
+
+# ### GSE14333, GSE17536, GSE33113
+# load(file="../rslt/gse17536.rfs.RData")
+# load(file="~/workspace/Other/Immune/CRC_IRGPs/data/crc_data.RData")
+# ind <- match(rownames(crc$gse14333$eps), rownames(crc_data$gse14333$gene.exp))
+# rfs <- crc_data$gse14333$rfs[ind]
+# stage <- c(crc_data$gse14333$stage[ind], gse17536.stage, rep(2, length(crc$gse33113$labels)))
+# ind <- stage %in% 2:3
+# 
+# sur <- rbind(rfs, gse17536.rfs, crc_data$gse33113$rfs)
+# newdata <- data.frame(scale(rbind(crc$gse14333$eps[, sig.genes], crc$gse17536$eps[, sig.genes], crc$gse33113$eps[, sig.genes])))
+# #newdata <- data.frame(rbind(scale(crc$gse14333$eps[, sig.genes]), scale(crc$gse17536$eps[, sig.genes]), scale(crc$gse33113$eps[, sig.genes])))[ind, ]
+# 
+# 
+# rs <-predict(model, newdata)
+# group <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+# plot_KMCurve(sur, group, annot = "", 
+#                          palette = "jama", xlab = "Follow up (months)", title = "Meta-datasets (validation 2)", risk.table = T, limit = 60) 
+```
+
+### Stage 2&3
+
+```{r}
+info <- clin.tcga
+ind <- info$stage %in% 2:3
+info <- info[ind, ]
+
+rfs <- Surv(info$relapse.time, info$relapse)
+
+p3 <- plot_KMCurve(rfs, info$risk, annot = "",
+                         palette = "jama", xlab = "Follow up (months)", title = "TCGA CRC stage 2/3 (Validation)", risk.table = T, limit = 60)
+
+info <- clin.cit
+ind <- info$tnm_stage %in% 2:3
+info <- info[ind, ]
+
+rfs <- Surv(as.numeric(as.character(info$rfs_delay)), factor(info$rfs_event, levels = 0:1))
+p4 <- plot_KMCurve(rfs, info$risk, annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2/3 (Validation)", risk.table = T, limit = 60) 
+```
+
+```{r fig.width=8, fig.height=9, cache=F}
+plot_grid(p1, p2, p3, p4,
+          labels = "auto", ncol = 2,  align = "hv")
+```
+
+
+```{r}
+## normalize the selected patients in the data set, instead of the whole data set
+
+# info <- clin.cit
+# ind <- info$tnm_stage %in% 2:3
+# info <- info[ind, ]
+# 
+# newdata <- (data.frame(scale(crc$gse39582$eps[ind, sig.genes])))
+# rs <-predict(model, newdata)
+# group <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+# 
+# rfs <- Surv(as.numeric(as.character(info$rfs_delay)), factor(info$rfs_event, levels = 0:1))
+# plot_KMCurve(rfs, group, annot = "", 
+#                          palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2/3 (Validation)", risk.table = T, limit = 60) 
+```
+
+### LNM predition
+
+```{r}
+extract_tcga_clinical <- function (clin) 
+{
+  #chemo_resp
+  chemo_resp <- clin[,"patient.follow_ups.follow_up.primary_therapy_outcome_success"]
+  names(chemo_resp) <- toupper(clin[, "patient.bcr_patient_barcode"])
+  chemo_resp[which(chemo_resp=="complete remission/response")] <- sub("complete remission/response","sen",
+                                                                      chemo_resp[which(chemo_resp=="complete remission/response")])
+  chemo_resp[which(chemo_resp=="partial remission/response")] <- sub("partial remission/response","p_sen",
+                                                                     chemo_resp[which(chemo_resp=="partial remission/response")])
+  chemo_resp[which(chemo_resp=="stable disease")] <- sub("stable disease","resist",
+                                                         chemo_resp[which(chemo_resp=="stable disease")])
+  chemo_resp[which(chemo_resp=="progressive disease")] <- sub("progressive disease","resist",
+                                                              chemo_resp[which(chemo_resp=="progressive disease")])
+  
+  #chemo
+  chemo <- clin[,"patient.drugs.drug.therapy_types.therapy_type"]
+  names(chemo) <- toupper(clin[, "patient.bcr_patient_barcode"])
+  chemo[is.na(chemo)] <- 0
+  chemo <- ifelse(chemo=="chemotherapy",1,0)
+  
+  Tstage <- clin[, "patient.stage_event.tnm_categories.pathologic_categories.pathologic_t"]
+  Tstage[grep("t4", Tstage)] <- 4
+  Tstage[grep("t3", Tstage)] <- 3
+  Tstage[grep("t2", Tstage)] <- 2
+  Tstage[grep("t1", Tstage)] <- 1
+  Tstage <- as.numeric(Tstage)
+  
+  Nstage <- clin[, "patient.stage_event.tnm_categories.pathologic_categories.pathologic_n"]
+  LN <- !Nstage == "n0"
+  LN[Nstage == "nx"] <- NA
+  
+  stage <- clin[, "patient.stage_event.pathologic_stage"]
+  names(stage) <- toupper(clin[, "patient.bcr_patient_barcode"])
+  pt_stage23 <- names(stage)[grep("ii", stage)]
+  stage[grep("iv", stage)] <- 4
+  stage[grep("iii", stage)] <- 3
+  stage[grep("ii", stage)] <- 2
+  stage[grep("i", stage)] <- 1
+  s <- as.numeric(stage)
+  names(s) <- names(stage)
+  stage <- s
+  labels <- clin[, "patient.follow_ups.follow_up.new_tumor_events.new_tumor_event_after_initial_treatment"]
+  names(labels) <- toupper(clin[, "patient.bcr_patient_barcode"])
+  relapse <- (labels == "yes")
+  names(relapse) <- names(labels)
+  
+  t <- c("patient.follow_ups.follow_up.new_tumor_events.new_tumor_event.days_to_new_tumor_event_after_initial_treatment", 
+    "patient.follow_ups.follow_up.days_to_death", "patient.follow_ups.follow_up.days_to_last_followup")
+  tmp <- clin[, t]
+  colnames(tmp) <- NULL
+  time <- tmp[, 1]
+  time[is.na(time)] <- as.vector(t(tmp[is.na(time), 2]))
+  time[is.na(time)] <- as.vector(t(tmp[is.na(time), 3]))
+  relapse.time <- as.numeric(time)
+  names(relapse.time) <- toupper(clin[, "patient.bcr_patient_barcode"])
+  
+  labels <- clin[, "patient.vital_status"]
+  names(labels) <- toupper(clin[, "patient.bcr_patient_barcode"])
+  death <- (labels == "dead")
+  names(death) <- names(labels)
+  
+  t <- c("patient.follow_ups.follow_up.days_to_death", "patient.follow_ups.follow_up.days_to_last_followup")
+  tmp <- clin[, t]
+  colnames(tmp) <- NULL
+  time <- tmp[, 1]
+  time[is.na(time)] <- as.vector(t(tmp[is.na(time), 2]))
+  death.time <- as.numeric(time)
+  names(death.time) <- toupper(clin[, "patient.bcr_patient_barcode"])
+  
+  #DFS
+  DFS <- relapse | death
+  DFS[is.na(DFS) & death] <- T
+  
+  #type <- factor(clin[, "patient.biospecimen_cqcf.histological_type"] == "esophagus adenocarcinoma  nos", levels = c(T, F), labels = c("EAC", "ESCC"))
+  
+  data.frame(stage, LN, Tstage, DFS, relapse, relapse.time, death, death.time, chemo, chemo_resp)
+}
+
+clin <- data.table::fread("../data/gdac.broadinstitute.org_COADREAD.Merge_Clinical.Level_1.2016012800.0.0/COADREAD.clin.merged.txt", stringsAsFactors = F, data.table = F)
+rownames(clin) <- clin[, 1]
+clin <- clin[, -1]
+
+clin <- extract_tcga_clinical(t(clin))
+clin[clin < 0] <- NA
+
+clin.tcga <- clin[substr(rownames(crc$tcga$eps), 1, 12), ]
+
+clin.tcga$relapse.time <- clin.tcga$relapse.time/30
+clin.tcga$death.time <- clin.tcga$death.time/30
+```
+
+```{r}
+clin.tcga <- clin.tcga[substr(rownames(crc$tcga$eps),1,12), ]
+
+library(glmnet)
+library(caret)
+
+newdata <- data.frame(Event=clin.tcga$LN, scale(crc$tcga$eps[, sig.genes]), check.names = F)
+
+ind <- !is.na(newdata$Event) & clin.tcga$Tstage %in% c(1:2)
+newdata <- newdata[ind, ]
+
+lab <- newdata$Event
+fit <- train(as.factor(Event) ~ ., newdata, method="glmnet")
+rs <- predict(fit, newdata, type = "prob")[, 1]
+
+fit <- glm(as.factor(Event) ~ ., newdata, family=binomial())
+rs <- predict(fit, newdata)
+
+plot_ROC(rs, lab, palette = "jama")
+```
+
+
+```{R}
+ # load("~/workspace/DeepCC_paper/analysis/21genes.RData")
+
+# GSE39582
+library(GEOquery)
+dat <- getGEO("GSE39582", destdir = "../data-raw/")[[1]] 
+gse39582.tstage <- as.character(pData(dat)[rownames(crc$gse39582$eps), c("characteristics_ch1.5")])
+gse39582.nstage <- as.character(pData(dat)[rownames(crc$gse39582$eps), c("characteristics_ch1.6")])
+
+gse39582.tstage <- as.numeric(gsub("tnm.t: T", "", gse39582.tstage))
+gse39582.nstage <- as.numeric(gsub("tnm.n: N", "", gse39582.nstage))
+gse39582.nstage <- gse39582.nstage > 0
+
+newdata <- data.frame(Event=gse39582.nstage, scale(crc$gse39582$eps[, sig.genes]), check.names = F)
+
+
+ind <- !is.na(newdata$Event) & gse39582.tstage %in% c(1:2)
+newdata <- newdata[ind, ]
+
+lab <- newdata$Event
+rs <- predict(fit, newdata, type = "prob")[, 1]
+
+rs <- predict(fit, newdata)
+plot_ROC(rs, lab, palette = "jama")
+```
+
+
+
+### adjuvant therapy decision for stage II CRC patients
+
+```{r}
+library(survival)
+library(survivalROC)
+
+rfs <- Surv(clin.tcga$relapse.time, clin.tcga$relapse)
+newdata <- data.frame(scale(crc$tcga$eps[, sig.genes]), check.names = F)
+model <- coxph(rfs ~ .,data=newdata)
+
+i <- clin.tcga$stage %in% c(2,3)
+
+model <- coxph(rfs[i, ] ~ .,data=newdata[i, ])
+
+rs <- predict(model, newdata)
+p <- survivalROC(Stime = rfs[, 1], status = rfs[, 2], marker = rs, predict.time = 12*5, method="KM")
+idx <- with(p, which.min(1-TP+ FP))
+rs_cut <- p$cut.values[idx]
+
+rs_cut <- median(rs)
+
+library(org.Hs.eg.db)
+#load("~/workspace/Baylor/CRC_m6a_RNA_methylation/data-raw/crc.RData")
+
+get_dat_mat <- function(dat) {
+  gene.exp <- t(dat)
+
+  ids <- strsplit(colnames(gene.exp), split = " /// ")
+  lt.ids <- sapply(ids, length)
+
+  gene.exp <- do.call(cbind, lapply(1:length(ids), function(i) sapply(1:lt.ids[i], function(x) gene.exp[, i])))
+  colnames(gene.exp) <- unlist(ids)
+
+  m <- apply(gene.exp, 2, mad)
+  i <- tapply(m, colnames(gene.exp), which.max)
+  ind <- tapply(1:ncol(gene.exp), colnames(gene.exp), function(x) x)
+  gene.exp <- gene.exp[, mapply(function(a, b) a[b], ind, i)]
+  
+  colnames(gene.exp) <- mapIds(org.Hs.eg.db, keys = colnames(gene.exp), keytype = "SYMBOL", column = "ENTREZID")
+
+  keygenes <- sig.genes
+
+  gene.exp <- gene.exp[, sig.genes]
+
+
+  rs <- predict(model, data.frame(scale(gene.exp), check.names = F))
+
+  labs <- as.character(factor(rs > rs_cut, levels=c(F, T), labels=c("Low", "High")))
+
+  df.plot <- data.frame(gene.exp,
+                        labs=labs, check.names = F)
+
+}
+
+wei_crc_data <- list(GSE14333_ge.syms,
+     GSE17536_ge.syms,
+     GSE26906_ge.syms,
+     GSE33113_ge.syms,
+     GSE37892_ge.syms,
+     GSE39084_ge.syms,
+     GSE39582_ge.syms)
+
+library(parallel)
+res <- mclapply(wei_crc_data, get_dat_mat, mc.cores = 10)
+# save(res, file="wei.crc.rs.RData")
+
+
+df <- do.call(rbind, res)
+
+# info_crc[rownames(df), ]
+
+
+```
+
+```{r}
+load(file = "clin.risk.group.RData")
+clin.cit$chemotherapy_adjuvant[clin.cit$chemotherapy_adjuvant == "na"] <- NA
+clin.cit$chemotherapy_adjuvant <- clin.cit$chemotherapy_adjuvant == "y"
+
+idx <- match(rownames(clin.cit), rownames(df))
+df$chemo[idx[!is.na(idx)]] <- clin.cit$chemotherapy_adjuvant[!is.na(idx)]
+
+
+#load(file="~/workspace/Other/Immune/CRC_IRGPs/data/crc_data.RData")
+chemo <- crc_data$gse14333$clin$Chemo == 1
+
+idx <- match(rownames(crc_data$gse14333$clin), rownames(df))
+df$chemo[idx[!is.na(idx)]] <- chemo[!is.na(idx)]
+
+ind <- info_crc[rownames(df), "stage"] == 2 & !is.na(df$chemo)
+df <- df[ind, ]
+
+
+df$chemo <- factor(df$chemo, levels = c(F, T), labels = c("Non-Chemo", "Chemo"))
+rfs <- info_crc[rownames(df), ]
+rfs <- Surv(rfs$rfsMo, rfs$rfsStat)
+
+
+labs <- factor(paste(as.character(df$labs), as.character(df$chemo)))
+plot_KMCurve(rfs, droplevels(labs))
+
+
+i <- df$chemo == "Chemo"
+plot_KMCurve(rfs[i, ], droplevels(labs[i]))
+
+i <- df$chemo != "Chemo"
+plot_KMCurve(rfs[i, ], droplevels(labs[i]))
+
+i <- df$labs == "High"
+plot_KMCurve(rfs[i, ], droplevels(labs[i]))
+
+```
+
+
+
+
+```{r}
+ind <- clin.crc$stage %in% 2
+
+rfs <- Surv(clin.crc$relapse.time/30, clin.crc$relapse)[ind, ]
+newdata <- data.frame(scale(crc$tcga$eps[, sig.genes]))[ind, ]
+
+rs <- predict(model, newdata)
+
+
+group <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+plot_KMCurve(rfs, group, annot = "",
+                         palette = "jama", xlab = "Follow up (months)", title = "TCGA CRC stage 2 (Validation)", risk.table = T, limit = 60)
+
+
+```
+
+```{r}
+load(file = "clin.risk.group.RData")
+
+
+ind <- clin.cit$tnm_stage %in% 2
+newdata <- (data.frame(scale(crc$gse39582$eps[, sig.genes])))[ind, ]
+chemo <- clin.cit$chemotherapy_adjuvant[ind]
+
+load(file="~/workspace/DeepCC_paper/rslt/crc.cit.clin.RData")
+
+sur <- Surv(as.numeric(as.character(clin$rfs_delay)), factor(clin$rfs_event, levels = 0:1))[ind, ]
+rs <-predict(model, newdata)
+group <- factor(rs > 0, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+
+idx <- !is.na(chemo)
+sur <- sur[idx, ]
+rs <- rs[idx]
+group <- group[idx]
+chemo <- chemo[idx]
+
+# plot_KMCurve(sur, group, annot = "", 
+#                          palette = "jama", xlab = "Follow up (months)", title = "CIT stage 3(Validation)", risk.table = T, limit = 60) 
+
+# idx <- which(chemo)
+# plot_KMCurve(sur[idx, ], group[idx], annot = "", 
+#                          palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2(Validation)", risk.table = T, limit = 60) 
+# 
+# idx <- which(!chemo)
+# plot_KMCurve(sur[idx, ], group[idx], annot = "", 
+#                          palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2(Validation)", risk.table = T, limit = 60) 
+
+idx <- group == "High-risk"
+rfs.high <- sur[idx, ]
+chemo.high <- chemo[idx]
+
+plot_KMCurve(sur[idx, ], chemo[idx], annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2(Validation)", risk.table = T) 
+
+idx <- group != "High-risk"
+rfs.low <- sur[idx, ]
+chemo.low <- chemo[idx]
+
+plot_KMCurve(sur[idx, ], chemo[idx], annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2(Validation)", risk.table = T) 
+```
+
+```{r}
+# sig.sym <- mapIds(org.Hs.eg.db, keys = sig.genes, keytype = "ENTREZID", column = "SYMBOL")
+
+ind <- match(rownames(crc$gse14333$eps), rownames(crc_data$gse14333$gene.exp))
+sur <- crc_data$gse14333$rfs[ind]
+chemo <- crc_data$gse14333$clin$Chemo[ind] == 1
+stage <- crc_data$gse14333$clin$DukesStage[ind]
+ind <- stage == " B"
+
+sur <- sur[ind, ]
+chemo <- chemo[ind]
+
+newdata <- data.frame(scale(crc$gse14333$eps[ind, sig.genes]), check.names = T)
+rs <-predict(model, newdata)
+group <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+
+idx <- !is.na(chemo)
+sur <- sur[idx, ]
+rs <- rs[idx]
+group <- group[idx]
+chemo <- chemo[idx]
+
+idx <- group == "High-risk"
+rfs.high <- rbind(rfs.high, sur[idx, ])
+chemo.high <- c(chemo.high, chemo[idx])
+
+plot_KMCurve(sur[idx, ], chemo[idx], annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2(Validation)", risk.table = T) 
+
+idx <- group != "High-risk"
+rfs.low <- rbind(rfs.low, sur[idx, ])
+chemo.low <- c(chemo.low, chemo[idx])
+
+plot_KMCurve(sur[idx, ], chemo[idx], annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "CIT stage 2(Validation)", risk.table = T) 
+```
+
+```{r}
+chemo.high.group <- factor(chemo.high, levels = c(F, T), labels = c("Non-Chemo", "Chemo"))
+p5 <- plot_KMCurve(rfs.high, chemo.high.group, annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "High-risk stage 2 (meta-validation)", risk.table = T, limit = 60) 
+
+chemo.low.group <- factor(chemo.low, levels = c(F, T), labels = c("Non-Chemo", "Chemo"))
+p6 <- plot_KMCurve(rfs.low, chemo.low.group, annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "Low-risk stage 2 (meta-validation)", risk.table = T, limit = 60) 
+```
+
+```{r fig.width=8, fig.height=4.5, cache=F}
+plot_grid(p5, p6,
+          labels = "auto", ncol = 2,  align = "hv")
+```
+
+
+```{r}
+ind <- clin.crc$stage %in% 3
+
+rfs <- Surv(clin.crc$relapse.time/30, clin.crc$relapse)[ind, ]
+newdata <- data.frame(scale(crc$tcga$eps[, sig.genes]))[ind, ]
+model <- coxph(rfs ~ .,data=newdata)
+
+
+rs <- predict(model, newdata)
+p <- survivalROC(Stime = rfs[, 1], status = rfs[, 2], marker = rs, predict.time = 12*5, method="KM")
+idx <- with(p, which.min(1-TP+ FP))
+rs_cut <- p$cut.values[idx]
+
+group <- factor(rs > 0, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+plot_KMCurve(rfs, group, annot = "",
+                         palette = "jama", xlab = "Follow up (months)", title = "TCGA CRC stage 3(Training)", risk.table = T, limit = 60)
+
+load(file="~/workspace/DeepCC_paper/rslt/crc.cit.clin.RData")
+
+ind <- crc$gse39582$clin$tnm_stage %in% 3
+newdata <- (data.frame(scale(crc$gse39582$eps[, sig.genes])))[ind, ]
+sur <- Surv(as.numeric(as.character(clin$rfs_delay)), factor(clin$rfs_event, levels = 0:1))[ind, ]
+rs <-predict(model, newdata)
+group <- factor(rs > 0, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+plot_KMCurve(sur, group, annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "CIT stage 3(Validation)", risk.table = T, limit = 60) 
+```
+
+```{r}
+### GSE14333, GSE17536, GSE33113
+load(file="../rslt/gse17536.rfs.RData")
+load(file="~/workspace/Other/Immune/CRC_IRGPs/data/crc_data.RData")
+ind <- match(rownames(crc$gse14333$eps), rownames(crc_data$gse14333$gene.exp))
+rfs <- crc_data$gse14333$rfs[ind]
+stage <- c(crc_data$gse14333$stage[ind], gse17536.stage, rep(2, length(crc$gse33113$labels)))
+
+sur <- rbind(rfs, gse17536.rfs, crc_data$gse33113$rfs)
+newdata <- data.frame(scale(rbind(crc$gse14333$eps[, sig.genes], crc$gse17536$eps[, sig.genes], crc$gse33113$eps[, sig.genes])))
+
+
+rs <-predict(model, newdata)
+group <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low-risk", "High-risk"))
+plot_KMCurve(sur, group, annot = "", 
+                         palette = "jama", xlab = "Follow up (months)", title = "Meta-datasets (validation 2)", risk.table = T, limit = 60) 
+
+```
+
+
+
+```{r}
+
+
+library(kernlab)
+cv5.sig <- function(a, sig) {
+  n <- length(a$labels)
+  testidx <- sample(n, n*0.2)
+  
+  trainData <- list(eps = a$eps[-testidx, ], labels = a$labels[-testidx])
+  testData <- list(eps = a$eps[testidx, ], labels = a$labels[testidx])
+  
+  trainEps <- curateExpressionProfile(trainData$eps[!is.na(trainData$labels), ], sig)
+  classifier <- ksvm(x = trainEps, y = factor(na.omit(trainData$labels)), kernel='rbfdot')
+  
+  unlist(getClassificationErrorRate(classifier, list(testData), sig))
+}
+
+library(pheatmap)
+library(kernlab)
+plotBioMarkerHeatmap <- function(data, sig, colour=NULL) {
+  labels <- na.omit(data$labels)
+  data <- scale(data$eps[!is.na(data$labels), sig], scale = T)
+
+  classifier <- ksvm(x = data, y = labels, kernel='rbfdot')
+  
+  data <- data[order(labels), ]
+  
+  annotation_row <- data.frame(Subtype = factor(sort(labels)), Pred = factor(predict(classifier, data)))
+  rownames(annotation_row) <- rownames(data)
+  
+  annotation_colors <- list(Subtype = colour, Pred = colour)
+  
+  pheatmap(data, cluster_row=FALSE, cluster_cols=T, fontsize=9, fontsize_row=6, show_rownames = F,
+           breaks = c(-4, seq(-1.5, 1.5, length.out = 98), 4),
+           annotation_row=annotation_row, annotation_legend = T, annotation_colors=annotation_colors)
+}
+
+```

@@ -1,0 +1,503 @@
+---
+title: "model_construction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DeepCC)
+library(gaofenglib)
+library(survival)
+library(parallel)
+library(gfplot)
+library(glmnet)
+library(survivalROC)
+library(ggplot2)
+library(extrafont)
+loadfonts()
+Arial <- Type1Font(family = "Arial",
+                   metrics = c("ArialMT.afm",
+                               "ArialMT-Bold.afm", 
+                               "ArialMT-Italic.afm",
+                               "ArialMT-BoldItalic.afm")
+                   )
+pdfFonts(Arial = Arial)
+#library(showtext)
+#font_add('Arial','/Library/Fonts/Arial.ttf') 
+#showtext_auto()
+
+```
+
+
+```{r}
+load("../data/crc_data_combat.RData")
+load("../rslt/tcga_df.RData")
+
+# load("../data/crc_combat.RData")
+# load("../rslt/tcga_df_0316.RData")
+
+# load("../data/crc_combat.RData")
+# load("../rslt/tcga_df_0316_v2.RData")
+
+# load("../data/crc_data_combat.RData")
+# load("../rslt/tcga_df_0316_v3.RData")
+```
+
+# obtain deep feature
+```{r}
+# load_DeepCC_model <- function(prefix){
+#   load(file = paste0(prefix, ".RData"))
+#   classifer <- keras::load_model_hdf5(filepath =paste0(prefix, ".hdf5"))
+#   list(classifier = classifer, levels = levels)
+# }
+# 
+# # for CRC model trained with TCGA data
+# CRC_TCGA <- load_DeepCC_model("../data/CRC_TCGA")
+```
+
+```{r}
+# tcga_exp <- crc_combat$TCGA
+# eps <- clean_dat(tcga_exp, keytype = "SYMBOL", column = "ENTREZID")
+# fs <- getFunctionalSpectra(eps)
+# 
+# df <- get_DeepCC_features(CRC_TCGA, fs)
+# save(fs, df, file = "../rslt/tcga_df.RData")
+```
+
+```{r}
+eps <- crc_combat$TCGA
+# df <- DF_COAD_TCGA
+
+calcEPCor <- function(ep, f){
+  n <- ncol(ep)
+  sapply(1:10, function(idx.feature){
+    tmp <- unlist(mclapply(1:n, function(idx) cor(ep[,idx], f[, idx.feature]), mc.cores = 60))
+    tmp[is.na(tmp)] <- 0
+    names(tmp) <- colnames(ep)[1:n]
+    tmp
+  })
+}
+
+findBioMarker <- function(correlation, eps, cutoff, access, groups=NULL, n=10){
+  library(org.Hs.eg.db)
+  ep.average <- colMeans(eps)
+  ep.genenames <- colnames(eps)
+  ep.mad <- apply(eps, 2, mad)
+  
+  res <- do.call(rbind, lapply(1:10, function(idx){
+    genes <- head(order(abs(correlation[,idx]), decreasing = T), n)
+    df <- data.frame(Feature=idx,
+                     Gene = ep.genenames[genes],
+                     # Gene=select(org.Hs.eg.db, keytype = "ENTREZID", key=ep.genenames[genes], columns = "SYMBOL"),
+                     AverageExperssion=ep.average[genes],
+                     MAD=ep.mad[genes])
+    
+    # df <- df[df$Gene.ENTREZID %in% access, ]
+    df <- df[df$Gene %in% access, ]
+    # df <- df[df$AverageExperssion > cutoff, ]
+    df <- df[order(df$MAD, decreasing = T), ]
+    head(df, 3)
+  }))
+  if(!is.null(groups)) {
+    res <- do.call(rbind, lapply(1:length(groups), function(i) {
+      idx <- groups[[i]]
+      tmp <- res[res$Feature %in% idx, ]
+      tmp$Feature <- paste("FeatureGroup", i)
+      # tmp[match(unique(tmp$Gene.ENTREZID), tmp$Gene.ENTREZID), ]
+      tmp[match(unique(tmp$Gene), tmp$Gene), ]
+    }))
+  } 
+  res
+}
+
+ep.cor <- calcEPCor(eps, df)
+
+# access <- Reduce(intersect, lapply(crc[c(1, 10, 13,14)], function(x) colnames(x$eps)))
+# access <- colnames(eps)
+access <- Reduce(intersect, lapply(crc_combat, function(x) colnames(x)))
+
+groups <- list(c(3,4,1,10), c(5,8),c(7,9,2,6))
+res <- findBioMarker(ep.cor, eps, 0, access, groups, n = 10)
+sig.genes <- unique(res$Gene)
+# signature <- unique(res$Gene)
+```
+
+```{r}
+datasets <- crc_combat
+clin_all <- crc_clin_all
+rownames(clin_all) <- clin_all$id
+get_survival <- function (clin)
+{
+    survival::Surv(clin[, "dfs.delay"], clin[, "dfs.event"] == 1)
+}
+i = 1
+dat <- datasets[[i]][, sig.genes]
+clin <- clin_all[substr(rownames(dat), 1, 12), ]
+sur <- get_survival(clin)
+ind <- !is.na(sur)
+dat <- data.frame(scale(dat[ind, ]))
+sur <- sur[ind, ]
+model <- coxph(sur ~ .,data=dat)
+
+#r <- summary(model)
+#r$concordance
+#low <- r$concordance[1]-1.96*r$concordance[2]
+#high <- r$concordance[1]+1.96*r$concordance[2]
+```
+
+
+```{r}
+pdf(file="survival_analysis.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, signature])
+    dat <- data.frame(scale(datasets[[i]][, sig.genes]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) #& clin$stage %in% stage.oi
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+  
+  rs <- predict(model, dat)
+    # rs <- predict(fit, dat, s = s)
+  #if(i == 1) rs_cut <- median(rs)
+  # rs_cut <- median(rs)
+  if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  labs <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low Risk", "High Risk"))
+  
+  p <- plot_KMCurve(sur, labs, ylab="DFS", color = c("#377EB8", "#E41A1C"), legend.pos = "none", title = title, xlab="Months", limit = 60)
+  p_list[i] <-list(p) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+```{r}
+lab.df <- lapply(1:length(datasets), function(i) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, sig.genes])
+    dat <- data.frame(scale(datasets[[i]][, sig.genes]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+
+  rs <- predict(model, dat)
+  # rs <- predict(fit, dat, s = s)
+  if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  labs <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low Risk", "High Risk"))
+
+
+  data.frame(Cohort=title,
+             RiskGroup=labs,
+             RiskScore=rs
+             )
+
+})
+
+lab.df <- do.call(rbind, lab.df)
+save(lab.df, rs_cut, file = "../rslt/labs.RData")
+```
+
+```{r}
+pdf(file="survival_analysis_TNM.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, signature])
+    dat <- data.frame(scale(datasets[[i]][, sig.genes]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) & clin$tnm.stage %in% c(2,3)
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+    
+  # rs <- predict(fit, dat, s = s)
+  rs <- predict(model, dat)
+  # if(i == 1) rs_cut <- median(rs)
+  if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  labs <- factor(rs > rs_cut, levels = c(F, T), labels = c("Low Risk", "High Risk"))
+  
+  p <- plot_KMCurve(sur, labs, ylab="DFS", color = c("#377EB8", "#E41A1C"), legend.pos = "none", title = paste0(title, ", Stage II-III"), xlab="Months", limit = 60)
+  
+  p_list[i] <-list(p) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+```{r}
+#roc/risk score
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, signature])
+    dat <- data.frame(scale(datasets[[i]][, sig.genes]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) #& clin$stage %in% stage.oi
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+  
+  rs <- predict(model, dat)
+    # rs <- predict(fit, dat, s = s)
+  #if(i == 1) rs_cut <- median(rs)
+  # rs_cut <- median(rs)
+  if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  
+  event <- clin[ind,]
+
+# p1 <- plot_RiskScore(rs - rs_cut, factor(event$dfs.event, labels = c("Alive", "Death")), color = c("#0073C2FF", "#EFC000FF")) + labs(title = title, y = "Adjusted risk score") 
+  
+p1 <- plot_RiskScore(rs - rs_cut, factor(event$dfs.event, labels = c("Disease-Free", "Recurrence")), palette = "jco") + labs(title = title, y = "Adjusted risk score") 
+
+p2 <- plot_TimeROC(rs, sur, 
+                 time_points =  c(24, 36, 60), groups = c("2-Year", "3-Year", "5-Year"),palette = "jco",
+                 title= title)
+  p_list[i] <-list(p1) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+
+pdf(file="roc.pdf",width = 10,height = 8)
+p_res
+dev.off()
+```
+
+```{r}
+pdf(file="roc_TNM.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, signature])
+    dat <- data.frame(scale(datasets[[i]][, sig.genes]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) & clin$tnm.stage %in% c(2,3)
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+    
+  # rs <- predict(fit, dat, s = s)
+  rs <- predict(model, dat)
+  event <- clin[ind,]
+  # if(i == 1) rs_cut <- median(rs)
+  if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+ p1 <- plot_RiskScore(rs - rs_cut, factor(event$dfs.event, labels = c("Disease-Free", "Recurrence")), palette = "jco") + labs(title = paste0(title, ", Stage II-III"), y = "Adjusted risk score") 
+
+p2 <- plot_TimeROC(rs, sur, 
+                 time_points =  c(24, 36, 60), groups = c("2-Year", "3-Year", "5-Year"),palette = "jco",
+                 title= paste0(title, ", Stage II-III"))
+  
+  p_list[i] <-list(p2) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+
+```{r}
+#oncotype DX
+pdf(file="oncotype_DX.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, signature])
+    dat <- data.frame(scale(datasets[[i]]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) #& clin$stage %in% stage.oi
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+  
+    oncotype <- calc_oncotypedx_crc(dat)
+    rs_oncotype <- oncotype$oncotypeDX_score
+    
+  #rs <- predict(model, dat)
+  # rs <- predict(fit, dat, s = s)
+  #if(i == 1) rs_cut <- median(rs)
+  # rs_cut <- median(rs)
+  #if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  
+
+# p1 <- plot_RiskScore(rs - rs_cut, factor(event$dfs.event, labels = c("Alive", "Death")), color = c("#0073C2FF", "#EFC000FF")) + labs(title = title, y = "Adjusted risk score") 
+  
+
+p2 <- plot_TimeROC(rs_oncotype, sur, 
+                 time_points =  c(24, 36, 60), groups = c("2-Year", "3-Year", "5-Year"),palette = "jco",
+                 title= paste0("Oncotype_DX_",title))
+  p_list[i] <-list(p2) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+```{r}
+pdf(file="survival_analysis_TNM_oncotype.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, signature])
+    dat <- data.frame(scale(datasets[[i]]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) & clin$tnm.stage %in% c(2,3)
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+    
+  # rs <- predict(fit, dat, s = s)
+    oncotype <- calc_oncotypedx_crc(dat)
+    rs_oncotype <- oncotype$oncotypeDX_score
+  # if(i == 1) rs_cut <- median(rs)
+    rs_cut <- median(rs_oncotype)
+
+  labs <- factor(rs_oncotype > rs_cut, levels = c(F, T), labels = c("Low Risk", "High Risk"))
+  
+  p <- plot_KMCurve(sur, labs, ylab="DFS", color = c("#377EB8", "#E41A1C"), legend.pos = "none", title = paste0(title, ", Stage II-III_OncotypeDX"), xlab="Months", limit = 60)
+  
+  p_list[i] <-list(p) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+```{r}
+pdf(file="Stage23.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    dat <- scale(datasets[[i]][, sig.genes])
+    #dat <- data.frame(scale(datasets[[i]]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) & clin$tnm.stage %in% c(2,3)
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+    dat <- as.data.frame(dat)
+   
+    
+  rs <- predict(model, dat)
+  # rs <- predict(fit, dat, s = s)
+  #if(i == 1) rs_cut <- median(rs)
+  # rs_cut <- median(rs)
+  #if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  
+
+# p1 <- plot_RiskScore(rs - rs_cut, factor(event$dfs.event, labels = c("Alive", "Death")), color = c("#0073C2FF", "#EFC000FF")) + labs(title = title, y = "Adjusted risk score") 
+  p2 <- plot_TimeROC(rs, sur, 
+                 time_points =  c(24, 36, 60), groups = c("2-Year", "3-Year", "5-Year"),palette = "jco",
+                 title= paste0("Stage23_",title))
+
+          
+  p_list[i] <-list(p2) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+```{r}
+pdf(file="survival_analysis_oncotype.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    # dat <- scale(datasets[[i]][, signature])
+    dat <- data.frame(scale(datasets[[i]]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) #& clin$tnm.stage %in% c(2,3)
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+    
+  # rs <- predict(fit, dat, s = s)
+    oncotype <- calc_oncotypedx_crc(dat)
+    rs_oncotype <- oncotype$oncotypeDX_score
+  # if(i == 1) rs_cut <- median(rs)
+    rs_cut <- median(rs_oncotype)
+
+  labs <- factor(oncotype$oncotypeDX_class, levels = c(	
+ "Low","Intermediate","High"),labels = c("Low_Risk","Intermediate","High_Risk"))
+  
+  p <- plot_KMCurve(sur, labs, ylab="DFS", color = c("#42B540","#377EB8", "#E41A1C"), legend.pos = "top", title = title, xlab="Months", limit = 60)
+  
+  p_list[i] <-list(p) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+```{r}
+pdf(file="Stage23_oncotype.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    dat <- scale(datasets[[i]])
+    #dat <- data.frame(scale(datasets[[i]]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) & clin$tnm.stage %in% c(2,3)
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+    dat <- as.data.frame(dat)
+   
+    
+   oncotype <- calc_oncotypedx_crc(dat)
+    rs_oncotype <- oncotype$oncotypeDX_score
+  # rs <- predict(fit, dat, s = s)
+  #if(i == 1) rs_cut <- median(rs)
+  # rs_cut <- median(rs)
+  #if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  
+
+# p1 <- plot_RiskScore(rs - rs_cut, factor(event$dfs.event, labels = c("Alive", "Death")), color = c("#0073C2FF", "#EFC000FF")) + labs(title = title, y = "Adjusted risk score") 
+  p2 <- plot_TimeROC(rs_oncotype, sur, 
+                 time_points =  c(24, 36, 60), groups = c("2-Year", "3-Year", "5-Year"),palette = "jco",
+                 title= paste0("Stage23_Oncotype",title))
+
+          
+  p_list[i] <-list(p2) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
+```{r}
+pdf(file="oncotype.pdf",width = 10,height = 8)
+p_list <- NULL
+for(i in 1:length(datasets)) {
+  title <- names(datasets)[i]
+    dat <- scale(datasets[[i]])
+    #dat <- data.frame(scale(datasets[[i]]))
+    clin <- clin_all[substr(rownames(dat), 1, 12), ]
+    sur <- get_survival(clin)
+    ind <- !is.na(sur) 
+    dat <- dat[ind, ]
+    sur <- sur[ind, ]
+    dat <- as.data.frame(dat)
+   
+    
+   oncotype <- calc_oncotypedx_crc(dat)
+    rs_oncotype <- oncotype$oncotypeDX_score
+  # rs <- predict(fit, dat, s = s)
+  #if(i == 1) rs_cut <- median(rs)
+  # rs_cut <- median(rs)
+  #if(i == 1) rs_cut <- calc_cutoff_survivalroc(sur, rs, 60)
+  
+
+# p1 <- plot_RiskScore(rs - rs_cut, factor(event$dfs.event, labels = c("Alive", "Death")), color = c("#0073C2FF", "#EFC000FF")) + labs(title = title, y = "Adjusted risk score") 
+  p2 <- plot_TimeROC(rs_oncotype, sur, 
+                 time_points =  c(24, 36, 60), groups = c("2-Year", "3-Year", "5-Year"),palette = "jco",
+                 title= paste0("Stage23_Oncotype",title))
+
+          
+  p_list[i] <-list(p2) 
+}
+p_res <- plot_grid(plotlist = p_list,ncol = 2)
+print(p_res)
+dev.off()
+```
+
